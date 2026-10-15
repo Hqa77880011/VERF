@@ -1,1 +1,1 @@
-from .method import VersionedFuzzy
+from .method import VersionedFuzzy as VersionedFuzzy
