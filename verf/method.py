@@ -102,14 +102,14 @@ class VersionedFuzzy:
             cache.append((identity, counterfactual, float(self.membership(x)[key[1]])))
         return probability, cache
 
-    def propose(self, key, after, now, injected=False, status="canary"):
+    def propose(self, key, after, now, injected=False, status="canary", compensating=False):
         if self.args.variant == "no_versions":
             self.counts[key] = after.copy()
             return -1
         previous = self.active.get(key)
         if previous is not None and self.versions[previous].status == "canary":
             return None
-        if now < self.cooldown.get(key, -1):
+        if not compensating and now < self.cooldown.get(key, -1):
             return None
         before = self.key_counts(key).copy()
         identity = self.next_identity
@@ -153,7 +153,7 @@ class VersionedFuzzy:
             self.versions[current].status = "superseded"
             correction = version.before + version.error_counts
             version.status = "rolled_back"
-            self.propose(version.key, correction, now)
+            self.propose(version.key, correction, now, compensating=True)
         else:
             self.counts[version.key] = version.before.copy()
             for index in descendants:
@@ -163,6 +163,18 @@ class VersionedFuzzy:
             if self.active.get(version.key) == identity:
                 self.active.pop(version.key)
         version.status = "rolled_back"
+        if self.args.variant == "global_rollback" or not dependent:
+            affected = {version.key}
+            if self.args.variant == "global_rollback":
+                affected.update(self.versions[index].key for index in descendants)
+            for key in affected:
+                retained = [node.identity for node in self.versions.values() if node.key == key and node.status in ("committed", "canary")]
+                if retained:
+                    self.active[key] = max(retained)
+                else:
+                    self.active.pop(key, None)
+            retained = [node.identity for node in self.versions.values() if node.status in ("committed", "canary")]
+            self.latest = max(retained, default=-1)
         self.reversals[version.key] = self.reversals.get(version.key, 0) + 1
         self.cooldown[version.key] = now + self.args.cooldown
         self.events.append(dict(time=now, action="rollback", version=identity, injected=version.injected,
@@ -176,12 +188,11 @@ class VersionedFuzzy:
             version = self.versions[identity]
             if version.status not in ("canary", "committed"):
                 continue
-            weight = membership * np.exp(-(now - issued) / self.args.recency)
             difference = float(np.sum((predicted - truth) ** 2) - np.sum((parent_prediction - truth) ** 2))
-            version.observations.append((issued, weight, difference))
+            version.observations.append((issued, membership, difference))
             version.observations = [row for row in version.observations if now - row[0] <= self.args.audit_horizon]
             version.error_counts[int(y)] += membership
-            weights = np.array([row[1] for row in version.observations])
+            weights = np.array([row[1] * np.exp(-(now - row[0]) / self.args.recency) for row in version.observations])
             changes = np.array([row[2] for row in version.observations])
             effective = weights.sum() ** 2 / (np.sum(weights ** 2) + 1e-12)
             minimum = self.args.minimum_feedback * (1 + self.reversals.get(version.key, 0))
